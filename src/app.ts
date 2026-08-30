@@ -9,6 +9,7 @@ import jwt from "jsonwebtoken";
 import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
 import { errorHandler } from "./middleware/error-handler";
 import { asyncHandler } from "./middleware/async-handler";
+import { notFoundHandler } from "./middleware/not-found";
 
 const app = express();
 
@@ -150,6 +151,8 @@ app.get(
     return response.status(200).json({ user });
   })
 );
+app.use(notFoundHandler);
 app.use(errorHandler);
+
 
 export default app;
