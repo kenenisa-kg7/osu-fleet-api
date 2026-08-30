@@ -38,7 +38,23 @@ app.use(express.json());
 app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
 });
-
+app.get("/health/ready", async (_request, response) => {
+  try {
+    await pool.query("SELECT 1");
+    return response.status(200).json({
+      status: "ready",
+      service: "osu-fleet-api",
+      database: "reachable",
+    });
+  } catch (error) {
+    console.error("Database readiness check failed:", error);
+    return response.status(503).json({
+      status: "not_ready",
+      service: "osu-fleet-api",
+      database: "unreachable",
+    });
+  }
+});
 app.get(
   "/admin/fleet-summary",
   authenticate,

@@ -21,6 +21,7 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+        "test": "node --import tsx --test src/app.test.ts"
   }
 }
