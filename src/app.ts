@@ -13,6 +13,7 @@ import { notFoundHandler } from "./middleware/not-found";
 import { requestIdMiddleware } from "./middleware/request-id";
 import helmet from "helmet";
 import cors from "cors";
+import { authRateLimit } from "./middleware/auth-rate-limit";
 const app = express();
 app.use(helmet());
 app.use(requestIdMiddleware);
@@ -78,6 +79,7 @@ app.post(
 
 app.post(
   "/auth/register",
+  authRateLimit,
   asyncHandler(async (request: Request, response: Response) => {
     const validation = userRegistrationSchema.safeParse(request.body);
 
@@ -101,6 +103,7 @@ app.post(
 
 app.post(
   "/auth/login",
+  authRateLimit,
   asyncHandler(async (request: Request, response: Response) => {
     const validation = userLoginSchema.safeParse(request.body);
     if (!validation.success) {
