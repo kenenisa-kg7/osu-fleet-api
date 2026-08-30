@@ -142,5 +142,10 @@ app.get(
     return response.status(200).json({ user });
   }
 );
+app.post("/auth/logout", (_request: Request, response: Response) => {
+  return response.status(200).json({
+    message: "Logout successful. Remove the token from the client.",
+  });
+});
 
 export default app;
