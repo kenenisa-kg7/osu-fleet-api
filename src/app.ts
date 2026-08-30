@@ -11,9 +11,10 @@ import { errorHandler } from "./middleware/error-handler";
 import { asyncHandler } from "./middleware/async-handler";
 import { notFoundHandler } from "./middleware/not-found";
 import { requestIdMiddleware } from "./middleware/request-id";
+import helmet from "helmet";
 
 const app = express();
-
+app.use(helmet());
 app.use(express.json());
 app.use(requestIdMiddleware);
 
