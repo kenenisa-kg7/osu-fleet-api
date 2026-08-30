@@ -7,3 +7,8 @@ export const userRegistrationSchema = z.object({
   password: z.string().min(8),
   role: z.enum(userRoles),
 });
+
+export const userLoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});

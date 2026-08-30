@@ -3,8 +3,9 @@ import type { Request, Response } from "express";
 import { tripRequestSchema } from "./schemas/trip";
 import { pool } from "./db";
 import { requireRole } from "./middleware/require-role";
-import { hash } from "bcryptjs";
-import { userRegistrationSchema } from "./schemas/user";
+import { compare, hash } from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
 
 const app = express();
 
@@ -55,6 +56,54 @@ app.post("/auth/register", async (request: Request, response: Response) => {
   );
 
   response.status(201).json({ message: "User registered", user: result.rows[0] });
+});
+
+app.post("/auth/login", async (request: Request, response: Response) => {
+  const validation = userLoginSchema.safeParse(request.body);
+  if (!validation.success) {
+    return response.status(400).json({
+      message: "Invalid login",
+      errors: validation.error.flatten(),
+    });
+  }
+  const { email, password } = validation.data;
+  const result = await pool.query(
+    `SELECT id, name, email, password_hash, role
+     FROM users
+     WHERE email = $1`,
+    [email]
+  );
+  const user = result.rows[0];
+  if (!user) {
+    return response.status(401).json({ message: "Invalid email or password" });
+  }
+  const passwordMatches = await compare(password, user.password_hash);
+  if (!passwordMatches) {
+    return response.status(401).json({ message: "Invalid email or password" });
+  }
+  const jwtSecret = process.env.JWT_SECRET;
+  if (!jwtSecret) {
+    console.error("JWT_SECRET is not configured");
+    return response.status(500).json({ message: "Authentication is not configured" });
+  }
+  const token = jwt.sign(
+    {
+      userId: user.id,
+      role: user.role,
+    },
+    jwtSecret,
+    { expiresIn: "1h" }
+  );
+  return response.status(200).json({
+    message: "Login successful",
+    token,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    },
+  });
 });
 
 export default app;
