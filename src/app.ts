@@ -12,11 +12,27 @@ import { asyncHandler } from "./middleware/async-handler";
 import { notFoundHandler } from "./middleware/not-found";
 import { requestIdMiddleware } from "./middleware/request-id";
 import helmet from "helmet";
-
+import cors from "cors";
 const app = express();
 app.use(helmet());
-app.use(express.json());
 app.use(requestIdMiddleware);
+const frontendOrigin = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Non-browser tools such as curl do not send an Origin header.
+      if (!origin || origin === frontendOrigin) {
+        return callback(null, true);
+      }
+      return callback(new Error("Origin is not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    credentials: true,
+  })
+);
+app.use(express.json());
+
 
 app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
