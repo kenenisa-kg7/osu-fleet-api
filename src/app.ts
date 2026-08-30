@@ -121,5 +121,26 @@ app.post("/auth/login", async (request: Request, response: Response) => {
     },
   });
 });
+app.get(
+  "/auth/me",
+  authenticate,
+  async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    if (!authenticatedRequest.user) {
+      return response.status(401).json({ message: "Authentication required" });
+    }
+    const result = await pool.query(
+      `SELECT id, name, email, role, created_at
+       FROM users
+       WHERE id = $1`,
+      [authenticatedRequest.user.userId]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return response.status(404).json({ message: "User not found" });
+    }
+    return response.status(200).json({ user });
+  }
+);
 
 export default app;
