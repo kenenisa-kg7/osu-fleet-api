@@ -8,6 +8,7 @@ import { compare, hash } from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
 import { errorHandler } from "./middleware/error-handler";
+import { asyncHandler } from "./middleware/async-handler";
 
 const app = express();
 
@@ -29,7 +30,7 @@ app.get(
 app.post(
   "/trip-requests",
   authenticate,
-  async (request: Request, response: Response) => {
+  asyncHandler(async (request: Request, response: Response) => {
     const validation = tripRequestSchema.safeParse(request.body);
 
     if (!validation.success) {
@@ -51,81 +52,87 @@ app.post(
     );
 
     response.status(201).json({ message: "Trip request created", tripRequest: result.rows[0] });
-  }
+  })
 );
 
 
-app.post("/auth/register", async (request: Request, response: Response) => {
-  const validation = userRegistrationSchema.safeParse(request.body);
+app.post(
+  "/auth/register",
+  asyncHandler(async (request: Request, response: Response) => {
+    const validation = userRegistrationSchema.safeParse(request.body);
 
-  if (!validation.success) {
-    return response.status(400).json({ message: "Invalid registration", errors: validation.error.flatten() });
-  }
+    if (!validation.success) {
+      return response.status(400).json({ message: "Invalid registration", errors: validation.error.flatten() });
+    }
 
-  const registration = validation.data;
-  const passwordHash = await hash(registration.password, 12);
+    const registration = validation.data;
+    const passwordHash = await hash(registration.password, 12);
 
-  const result = await pool.query(
-    `INSERT INTO users (name, email, password_hash, role)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, name, email, role, created_at`,
-    [registration.name, registration.email, passwordHash, registration.role]
-  );
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, role, created_at`,
+      [registration.name, registration.email, passwordHash, registration.role]
+    );
 
-  response.status(201).json({ message: "User registered", user: result.rows[0] });
-});
+    response.status(201).json({ message: "User registered", user: result.rows[0] });
+  })
+);
 
-app.post("/auth/login", async (request: Request, response: Response) => {
-  const validation = userLoginSchema.safeParse(request.body);
-  if (!validation.success) {
-    return response.status(400).json({
-      message: "Invalid login",
-      errors: validation.error.flatten(),
+app.post(
+  "/auth/login",
+  asyncHandler(async (request: Request, response: Response) => {
+    const validation = userLoginSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid login",
+        errors: validation.error.flatten(),
+      });
+    }
+    const { email, password } = validation.data;
+    const result = await pool.query(
+      `SELECT id, name, email, password_hash, role
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return response.status(401).json({ message: "Invalid email or password" });
+    }
+    const passwordMatches = await compare(password, user.password_hash);
+    if (!passwordMatches) {
+      return response.status(401).json({ message: "Invalid email or password" });
+    }
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      console.error("JWT_SECRET is not configured");
+      return response.status(500).json({ message: "Authentication is not configured" });
+    }
+    const token = jwt.sign(
+      {
+        userId: user.id,
+        role: user.role,
+      },
+      jwtSecret,
+      { expiresIn: "1h" }
+    );
+    return response.status(200).json({
+      message: "Login successful",
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
     });
-  }
-  const { email, password } = validation.data;
-  const result = await pool.query(
-    `SELECT id, name, email, password_hash, role
-     FROM users
-     WHERE email = $1`,
-    [email]
-  );
-  const user = result.rows[0];
-  if (!user) {
-    return response.status(401).json({ message: "Invalid email or password" });
-  }
-  const passwordMatches = await compare(password, user.password_hash);
-  if (!passwordMatches) {
-    return response.status(401).json({ message: "Invalid email or password" });
-  }
-  const jwtSecret = process.env.JWT_SECRET;
-  if (!jwtSecret) {
-    console.error("JWT_SECRET is not configured");
-    return response.status(500).json({ message: "Authentication is not configured" });
-  }
-  const token = jwt.sign(
-    {
-      userId: user.id,
-      role: user.role,
-    },
-    jwtSecret,
-    { expiresIn: "1h" }
-  );
-  return response.status(200).json({
-    message: "Login successful",
-    token,
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-    },
-  });
-});
+  })
+);
 app.get(
   "/auth/me",
   authenticate,
-  async (request: Request, response: Response) => {
+  asyncHandler(async (request: Request, response: Response) => {
     const authenticatedRequest = request as AuthenticatedRequest;
     if (!authenticatedRequest.user) {
       return response.status(401).json({ message: "Authentication required" });
@@ -141,13 +148,8 @@ app.get(
       return response.status(404).json({ message: "User not found" });
     }
     return response.status(200).json({ user });
-  }
+  })
 );
-app.post("/auth/logout", (_request: Request, response: Response) => {
-  return response.status(200).json({
-    message: "Logout successful. Remove the token from the client.",
-  });
-});
 app.use(errorHandler);
 
 export default app;
