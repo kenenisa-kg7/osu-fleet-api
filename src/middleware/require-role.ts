@@ -1,19 +1,20 @@
-import type { Request, Response, NextFunction } from "express";
-import type { UserRole } from "../types/user";
-import { userRoles } from "../types/user";
+import type { NextFunction, Response } from "express";
+import type { AuthenticatedRequest } from "./authenticate";
 
-export function requireRole(...allowedRoles: UserRole[]) {
-  return (request: Request, response: Response, next: NextFunction) => {
-    const roleFromHeader = request.header("x-user-role");
-
-    if (!roleFromHeader || !userRoles.includes(roleFromHeader as UserRole)) {
-      return response.status(401).json({ message: "Missing or invalid role header" });
+export function requireRole(...allowedRoles: string[]) {
+  return (
+    request: AuthenticatedRequest,
+    response: Response,
+    next: NextFunction
+  ) => {
+    if (!request.user) {
+      return response.status(401).json({ message: "Authentication required" });
     }
 
-    if (!allowedRoles.includes(roleFromHeader as UserRole)) {
-      return response.status(403).json({ message: "You don't have permission to do that" });
+    if (!allowedRoles.includes(request.user.role)) {
+      return response.status(403).json({ message: "Forbidden" });
     }
 
-    next();
+    return next();
   };
 }

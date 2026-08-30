@@ -3,6 +3,7 @@ import type { Request, Response } from "express";
 import { tripRequestSchema } from "./schemas/trip";
 import { pool } from "./db";
 import { requireRole } from "./middleware/require-role";
+import { authenticate } from "./middleware/authenticate";
 import { compare, hash } from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
@@ -15,9 +16,14 @@ app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
 });
 
-app.get("/admin/fleet-summary", requireRole("admin", "staff"), (_request, response) => {
-  response.status(200).json({ message: "Fleet summary access granted" });
-});
+app.get(
+  "/admin/fleet-summary",
+  authenticate,
+  requireRole("admin", "staff"),
+  (_request, response) => {
+    response.status(200).json({ message: "Fleet summary access granted" });
+  }
+);
 
 app.post("/trip-requests", async (request: Request, response: Response) => {
   const validation = tripRequestSchema.safeParse(request.body);
