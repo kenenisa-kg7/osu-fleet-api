@@ -3,10 +3,16 @@ import type { Request, Response } from "express";
 import { tripRequestSchema } from "./schemas/trip";
 import { pool } from "./db";
 import { requireRole } from "./middleware/require-role";
+import { hash } from "bcryptjs";
+import { userRegistrationSchema } from "./schemas/user";
 
 const app = express();
 
 app.use(express.json());
+
+app.get("/health", (_request, response) => {
+  response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
+});
 
 app.get("/admin/fleet-summary", requireRole("admin", "staff"), (_request, response) => {
   response.status(200).json({ message: "Fleet summary access granted" });
@@ -29,6 +35,26 @@ app.post("/trip-requests", async (request: Request, response: Response) => {
   );
 
   response.status(201).json({ message: "Trip request created", tripRequest: result.rows[0] });
+});
+
+app.post("/auth/register", async (request: Request, response: Response) => {
+  const validation = userRegistrationSchema.safeParse(request.body);
+
+  if (!validation.success) {
+    return response.status(400).json({ message: "Invalid registration", errors: validation.error.flatten() });
+  }
+
+  const registration = validation.data;
+  const passwordHash = await hash(registration.password, 12);
+
+  const result = await pool.query(
+    `INSERT INTO users (name, email, password_hash, role)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, name, email, role, created_at`,
+    [registration.name, registration.email, passwordHash, registration.role]
+  );
+
+  response.status(201).json({ message: "User registered", user: result.rows[0] });
 });
 
 export default app;
