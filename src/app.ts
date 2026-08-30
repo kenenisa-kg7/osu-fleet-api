@@ -7,6 +7,7 @@ import { authenticate, type AuthenticatedRequest } from "./middleware/authentica
 import { compare, hash } from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
+import { errorHandler } from "./middleware/error-handler";
 
 const app = express();
 
@@ -147,5 +148,6 @@ app.post("/auth/logout", (_request: Request, response: Response) => {
     message: "Logout successful. Remove the token from the client.",
   });
 });
+app.use(errorHandler);
 
 export default app;
