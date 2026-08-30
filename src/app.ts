@@ -10,10 +10,12 @@ import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
 import { errorHandler } from "./middleware/error-handler";
 import { asyncHandler } from "./middleware/async-handler";
 import { notFoundHandler } from "./middleware/not-found";
+import { requestIdMiddleware } from "./middleware/request-id";
 
 const app = express();
 
 app.use(express.json());
+app.use(requestIdMiddleware);
 
 app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
