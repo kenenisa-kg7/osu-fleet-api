@@ -14,9 +14,12 @@ import { requestIdMiddleware } from "./middleware/request-id";
 import helmet from "helmet";
 import cors from "cors";
 import { authRateLimit } from "./middleware/auth-rate-limit";
+
 const app = express();
+
 app.use(helmet());
 app.use(requestIdMiddleware);
+
 const frontendOrigin = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
 app.use(
   cors({
@@ -32,12 +35,13 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
 
+app.use(express.json());
 
 app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "osu-fleet-api", version: "0.1.0" });
 });
+
 app.get("/health/ready", async (_request, response) => {
   try {
     await pool.query("SELECT 1");
@@ -55,6 +59,7 @@ app.get("/health/ready", async (_request, response) => {
     });
   }
 });
+
 app.get(
   "/admin/fleet-summary",
   authenticate,
@@ -91,7 +96,6 @@ app.post(
     response.status(201).json({ message: "Trip request created", tripRequest: result.rows[0] });
   })
 );
-
 
 app.post(
   "/auth/register",
@@ -168,6 +172,7 @@ app.post(
     });
   })
 );
+
 app.get(
   "/auth/me",
   authenticate,
@@ -189,8 +194,14 @@ app.get(
     return response.status(200).json({ user });
   })
 );
+
+app.post("/auth/logout", (_request: Request, response: Response) => {
+  return response.status(200).json({
+    message: "Logout successful. Remove the token from the client.",
+  });
+});
+
 app.use(notFoundHandler);
 app.use(errorHandler);
-
 
 export default app;

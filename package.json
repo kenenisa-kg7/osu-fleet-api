@@ -22,6 +22,6 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
-        "test": "node --import tsx --test src/app.test.ts"
+    "test": "node --import tsx --test src/app.test.ts src/auth.test.ts"
   }
 }
