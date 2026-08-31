@@ -14,6 +14,7 @@ import { requestIdMiddleware } from "./middleware/request-id";
 import helmet from "helmet";
 import cors from "cors";
 import { authRateLimit } from "./middleware/auth-rate-limit";
+import { roles } from "./middleware/roles";
 
 const app = express();
 
@@ -63,15 +64,15 @@ app.get("/health/ready", async (_request, response) => {
 app.get(
   "/admin/fleet-summary",
   authenticate,
-  requireRole("admin", "staff"),
+  requireRole(roles.admin, roles.staff),
   (_request, response) => {
     response.status(200).json({ message: "Fleet summary access granted" });
   }
 );
-
 app.post(
   "/trip-requests",
   authenticate,
+  requireRole(roles.admin, roles.staff),
   asyncHandler(async (request: Request, response: Response) => {
     const validation = tripRequestSchema.safeParse(request.body);
 
