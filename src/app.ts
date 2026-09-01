@@ -1,12 +1,12 @@
 import express from "express";
 import type { Request, Response } from "express";
 import { tripRequestSchema } from "./schemas/trip";
-import { pool } from "./db";
+import { pool, withTransaction } from "./db";
 import { requireRole } from "./middleware/require-role";
 import { authenticate, type AuthenticatedRequest } from "./middleware/authenticate";
 import { compare, hash } from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { userLoginSchema, userRegistrationSchema } from "./schemas/user";
+import { userLoginSchema, userRegistrationSchema, adminUserCreationSchema, userStatusSchema, userRoleSchema } from "./schemas/user";
 import { errorHandler } from "./middleware/error-handler";
 import { asyncHandler } from "./middleware/async-handler";
 import { notFoundHandler } from "./middleware/not-found";
@@ -15,11 +15,10 @@ import helmet from "helmet";
 import cors from "cors";
 import { authRateLimit } from "./middleware/auth-rate-limit";
 import { roles } from "./middleware/roles";
-import { adminUserCreationSchema } from "./schemas/user";
-import { roles } from "./middleware/roles";
-import { userStatusSchema } from "./schemas/user";
-import { userRoleSchema } from "./schemas/user";
 import { recordAuditLog } from "./audit-log";
+import { tripRequestDecisionSchema } from "./schemas/trip";
+import { tripAssignmentSchema } from "./schemas/trip";
+
 
 const app = express();
 
@@ -74,6 +73,51 @@ app.get(
     response.status(200).json({ message: "Fleet summary access granted" });
   }
 );
+app.get(
+  "/trip-requests",
+  authenticate,
+  requireRole(roles.admin, roles.staff),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const userId = authenticatedRequest.user!.userId;
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const offset = (page - 1) * limit;
+    const [requestsResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT id, purpose, origin, destination, pickup_time,
+                passengers, requested_by, department, status, created_at
+         FROM trip_requests
+         WHERE requested_by = $1
+         ORDER BY created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM trip_requests
+         WHERE requested_by = $1`,
+        [userId]
+      ),
+    ]);
+    const total = countResult.rows[0].total;
+    return response.status(200).json({
+      tripRequests: requestsResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  })
+);
 app.post(
   "/trip-requests",
   authenticate,
@@ -92,14 +136,28 @@ app.post(
 
     const trip = validation.data;
 
-    const result = await pool.query(
-      `INSERT INTO trip_requests (purpose, origin, destination, pickup_time, passengers, requested_by, department)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, purpose, origin, destination, pickup_time, passengers, requested_by, department, status, created_at`,
-      [trip.purpose, trip.origin, trip.destination, trip.pickupTime, trip.passengers, authenticatedRequest.user.userId, trip.department]
-    );
+    const tripRequest = await withTransaction(async (client) => {
+      const result = await client.query(
+        `INSERT INTO trip_requests
+           (purpose, origin, destination, pickup_time, passengers, requested_by, department, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, purpose, origin, destination, pickup_time, passengers,
+                   requested_by, department, status, created_at`,
+        [
+          trip.purpose,
+          trip.origin,
+          trip.destination,
+          trip.pickupTime,
+          trip.passengers,
+          authenticatedRequest.user.userId,
+          trip.department,
+          "pending",
+        ]
+      );
+      return result.rows[0];
+    });
 
-    response.status(201).json({ message: "Trip request created", tripRequest: result.rows[0] });
+    response.status(201).json({ message: "Trip request created", tripRequest });
   })
 );
 
@@ -140,12 +198,15 @@ app.post(
     }
     const { email, password } = validation.data;
     const result = await pool.query(
-  `SELECT id, name, email, password_hash, role, is_active
-   FROM users
-   WHERE email = $1`,
-  [email]
-);
+      `SELECT id, name, email, password_hash, role, is_active
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
     const user = result.rows[0];
+    if (!user) {
+      return response.status(401).json({ message: "Invalid email or password" });
+    }
     if (!user.is_active) {
       return response.status(401).json({ message: "Invalid email or password" });
     }
@@ -206,6 +267,7 @@ app.post("/auth/logout", (_request: Request, response: Response) => {
     message: "Logout successful. Remove the token from the client.",
   });
 });
+
 app.post(
   "/admin/users",
   authenticate,
@@ -220,18 +282,113 @@ app.post(
     }
     const userData = validation.data;
     const passwordHash = await hash(userData.password, 12);
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, email, role, created_at`,
-      [userData.name, userData.email, passwordHash, userData.role]
-    );
+    const authenticatedRequest = request as AuthenticatedRequest;
+
+    const user = await withTransaction(async (client) => {
+      const result = await client.query(
+        `INSERT INTO users (name, email, password_hash, role)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, email, role, created_at`,
+        [userData.name, userData.email, passwordHash, userData.role]
+      );
+      const createdUser = result.rows[0];
+
+      await recordAuditLog(
+        {
+          actorUserId: authenticatedRequest.user!.userId,
+          action: "user.created",
+          targetUserId: createdUser.id,
+          metadata: { role: createdUser.role },
+        },
+        client
+      );
+
+      return createdUser;
+    });
+
     return response.status(201).json({
       message: "User created",
-      user: result.rows[0],
+      user,
     });
   })
 );
+app.get(
+  "/admin/trip-requests",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const requestedStatus = request.query.status;
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const allowedStatuses = [
+      "pending",
+      "approved",
+      "rejected",
+      "assigned",
+      "completed",
+      "cancelled",
+    ];
+    if (
+      typeof requestedStatus === "string" &&
+      !allowedStatuses.includes(requestedStatus)
+    ) {
+      return response.status(400).json({ message: "Invalid trip status filter" });
+    }
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    if (typeof requestedStatus === "string" && requestedStatus.length > 0) {
+      values.push(requestedStatus);
+      conditions.push(`tr.status = $${values.length}`);
+    }
+    const whereClause = conditions.length > 0
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
+    const offset = (page - 1) * limit;
+    const limitParameter = values.length + 1;
+    const offsetParameter = values.length + 2;
+    const [requestsResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT tr.id, tr.purpose, tr.origin, tr.destination,
+                tr.pickup_time, tr.passengers, tr.requested_by,
+                tr.department, tr.status, tr.created_at,
+                u.name AS requester_name,
+                u.email AS requester_email
+         FROM trip_requests tr
+         JOIN users u ON u.id = tr.requested_by
+         ${whereClause}
+         ORDER BY tr.created_at DESC
+         LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
+        [...values, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM trip_requests tr
+         ${whereClause}`,
+        values
+      ),
+    ]);
+    const total = countResult.rows[0].total;
+    return response.status(200).json({
+      tripRequests: requestsResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+      filters: {
+        status: typeof requestedStatus === "string" ? requestedStatus : null,
+      },
+    });
+  })
+);
+
 app.get(
   "/admin/users",
   authenticate,
@@ -298,15 +455,6 @@ app.get(
     ]);
 
     const total = countResult.rows[0].total;
-    const authenticatedRequest = request as AuthenticatedRequest;
-await recordAuditLog({
-  actorUserId: authenticatedRequest.user!.userId,
-  action: "user.created",
-  targetUserId: user.id,
-  metadata: {
-    role: user.role,
-  },
-});
 
     return response.status(200).json({
       users: usersResult.rows,
@@ -323,6 +471,7 @@ await recordAuditLog({
     });
   })
 );
+
 app.patch(
   "/admin/users/:userId/status",
   authenticate,
@@ -339,23 +488,30 @@ app.patch(
         errors: validation.error.flatten(),
       });
     }
-    const result = await pool.query(
-      `UPDATE users
-       SET is_active = $1
-       WHERE id = $2
-       RETURNING id, name, email, role, is_active, created_at`,
-      [validation.data.isActive, userId]
-    );
-    const user = result.rows[0];
     const authenticatedRequest = request as AuthenticatedRequest;
-await recordAuditLog({
-  actorUserId: authenticatedRequest.user!.userId,
-  action: "user.status_updated",
-  targetUserId: user.id,
-  metadata: {
-    isActive: user.is_active,
-  },
-});
+    const user = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE users
+         SET is_active = $1
+         WHERE id = $2
+         RETURNING id, name, email, role, is_active, created_at`,
+        [validation.data.isActive, userId]
+      );
+      const updatedUser = result.rows[0];
+      if (!updatedUser) {
+        return null;
+      }
+      await recordAuditLog(
+        {
+          actorUserId: authenticatedRequest.user!.userId,
+          action: "user.status_updated",
+          targetUserId: updatedUser.id,
+          metadata: { isActive: updatedUser.is_active },
+        },
+        client
+      );
+      return updatedUser;
+    });
     if (!user) {
       return response.status(404).json({ message: "User not found" });
     }
@@ -365,6 +521,7 @@ await recordAuditLog({
     });
   })
 );
+
 app.patch(
   "/admin/users/:userId/role",
   authenticate,
@@ -381,29 +538,160 @@ app.patch(
         errors: validation.error.flatten(),
       });
     }
-    const result = await pool.query(
-      `UPDATE users
-       SET role = $1
-       WHERE id = $2
-       RETURNING id, name, email, role, is_active, created_at`,
-      [validation.data.role, userId]
-    );
-    const user = result.rows[0];
     const authenticatedRequest = request as AuthenticatedRequest;
-await recordAuditLog({
-  actorUserId: authenticatedRequest.user!.userId,
-  action: "user.role_updated",
-  targetUserId: user.id,
-  metadata: {
-    role: user.role,
-  },
-});
+    const user = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE users
+         SET role = $1
+         WHERE id = $2
+         RETURNING id, name, email, role, is_active, created_at`,
+        [validation.data.role, userId]
+      );
+      const updatedUser = result.rows[0];
+      if (!updatedUser) {
+        return null;
+      }
+      await recordAuditLog(
+        {
+          actorUserId: authenticatedRequest.user!.userId,
+          action: "user.role_updated",
+          targetUserId: updatedUser.id,
+          metadata: { role: updatedUser.role },
+        },
+        client
+      );
+      return updatedUser;
+    });
     if (!user) {
       return response.status(404).json({ message: "User not found" });
     }
     return response.status(200).json({
       message: "User role updated",
       user,
+    });
+  })
+);
+app.patch(
+  "/admin/trip-requests/:tripId/status",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const tripId = request.params.tripId;
+    if (!tripId || typeof tripId !== "string") {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+    const validation = tripRequestDecisionSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid trip decision",
+        errors: validation.error.flatten(),
+      });
+    }
+    const result = await pool.query(
+      `UPDATE trip_requests
+       SET status = $1
+       WHERE id = $2 AND status = 'pending'
+       RETURNING id, purpose, origin, destination, pickup_time,
+                 passengers, requested_by, department, status, created_at`,
+      [validation.data.status, tripId]
+    );
+    const tripRequest = result.rows[0];
+    if (!tripRequest) {
+      const existing = await pool.query(
+        `SELECT id, status
+         FROM trip_requests
+         WHERE id = $1`,
+        [tripId]
+      );
+      if (!existing.rows[0]) {
+        return response.status(404).json({ message: "Trip request not found" });
+      }
+      return response.status(409).json({
+        message: "Only pending trip requests can be decided",
+        status: existing.rows[0].status,
+      });
+    }
+    return response.status(200).json({
+      message: `Trip request ${validation.data.status}`,
+      tripRequest,
+    });
+  })
+);
+app.patch(
+  "/admin/trip-requests/:tripId/assign",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const tripId = request.params.tripId;
+
+    if (!tripId || typeof tripId !== "string") {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const validation = tripAssignmentSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid driver assignment",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const driverResult = await pool.query(
+      `SELECT id, name, email, role, is_active
+       FROM users
+       WHERE id = $1`,
+      [validation.data.driverId]
+    );
+
+    const driver = driverResult.rows[0];
+
+    if (!driver) {
+      return response.status(404).json({ message: "Driver not found" });
+    }
+
+    if (driver.role !== roles.driver || !driver.is_active) {
+      return response.status(409).json({
+        message: "User is not an active driver",
+      });
+    }
+
+    const tripResult = await pool.query(
+      `UPDATE trip_requests
+       SET driver_id = $1,
+           assigned_at = NOW(),
+           status = 'assigned'
+       WHERE id = $2 AND status = 'approved'
+       RETURNING id, purpose, origin, destination, pickup_time,
+                 passengers, requested_by, department, status,
+                 driver_id, assigned_at, created_at`,
+      [driver.id, tripId]
+    );
+
+    const tripRequest = tripResult.rows[0];
+
+    if (!tripRequest) {
+      const existing = await pool.query(
+        `SELECT id, status
+         FROM trip_requests
+         WHERE id = $1`,
+        [tripId]
+      );
+
+      if (!existing.rows[0]) {
+        return response.status(404).json({ message: "Trip request not found" });
+      }
+
+      return response.status(409).json({
+        message: "Only approved trip requests can be assigned",
+        status: existing.rows[0].status,
+      });
+    }
+
+    return response.status(200).json({
+      message: "Trip request assigned",
+      tripRequest,
+      driver,
     });
   })
 );
