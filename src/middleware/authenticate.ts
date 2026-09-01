@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt, { type JwtPayload } from "jsonwebtoken";
+import { pool } from "../db";
 
 export type AuthenticatedUser = {
   userId: string;
@@ -10,7 +11,7 @@ export type AuthenticatedRequest = Request & {
   user?: AuthenticatedUser;
 };
 
-export function authenticate(
+export async function authenticate(
   request: Request,
   response: Response,
   next: NextFunction
@@ -32,16 +33,28 @@ export function authenticate(
   try {
     const decoded = jwt.verify(token, jwtSecret) as JwtPayload;
 
-    if (
-      typeof decoded.userId !== "string" ||
-      typeof decoded.role !== "string"
-    ) {
+    if (typeof decoded.userId !== "string") {
       return response.status(401).json({ message: "Invalid token" });
     }
 
+    const result = await pool.query(
+      `SELECT id, role, is_active
+       FROM users
+       WHERE id = $1`,
+      [decoded.userId]
+    );
+
+    const user = result.rows[0];
+
+    if (!user || !user.is_active) {
+      return response.status(401).json({ message: "Account is inactive or unavailable" });
+    }
+
+    // The database is authoritative for the current role. This means a role
+    // change takes effect even if the old JWT has not expired yet.
     (request as AuthenticatedRequest).user = {
-      userId: decoded.userId,
-      role: decoded.role,
+      userId: user.id,
+      role: user.role,
     };
 
     return next();

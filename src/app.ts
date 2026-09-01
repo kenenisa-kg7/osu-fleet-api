@@ -15,6 +15,11 @@ import helmet from "helmet";
 import cors from "cors";
 import { authRateLimit } from "./middleware/auth-rate-limit";
 import { roles } from "./middleware/roles";
+import { adminUserCreationSchema } from "./schemas/user";
+import { roles } from "./middleware/roles";
+import { userStatusSchema } from "./schemas/user";
+import { userRoleSchema } from "./schemas/user";
+import { recordAuditLog } from "./audit-log";
 
 const app = express();
 
@@ -115,7 +120,7 @@ app.post(
       `INSERT INTO users (name, email, password_hash, role)
        VALUES ($1, $2, $3, $4)
        RETURNING id, name, email, role, created_at`,
-      [registration.name, registration.email, passwordHash, registration.role]
+      [registration.name, registration.email, passwordHash, "staff"]
     );
 
     response.status(201).json({ message: "User registered", user: result.rows[0] });
@@ -135,13 +140,13 @@ app.post(
     }
     const { email, password } = validation.data;
     const result = await pool.query(
-      `SELECT id, name, email, password_hash, role
-       FROM users
-       WHERE email = $1`,
-      [email]
-    );
+  `SELECT id, name, email, password_hash, role, is_active
+   FROM users
+   WHERE email = $1`,
+  [email]
+);
     const user = result.rows[0];
-    if (!user) {
+    if (!user.is_active) {
       return response.status(401).json({ message: "Invalid email or password" });
     }
     const passwordMatches = await compare(password, user.password_hash);
@@ -201,6 +206,207 @@ app.post("/auth/logout", (_request: Request, response: Response) => {
     message: "Logout successful. Remove the token from the client.",
   });
 });
+app.post(
+  "/admin/users",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const validation = adminUserCreationSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid user data",
+        errors: validation.error.flatten(),
+      });
+    }
+    const userData = validation.data;
+    const passwordHash = await hash(userData.password, 12);
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, role, created_at`,
+      [userData.name, userData.email, passwordHash, userData.role]
+    );
+    return response.status(201).json({
+      message: "User created",
+      user: result.rows[0],
+    });
+  })
+);
+app.get(
+  "/admin/users",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const requestedRole = request.query.role;
+    const requestedSearch = request.query.search;
+
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+
+    if (typeof requestedRole === "string" && requestedRole.length > 0) {
+      const validRoles = [roles.admin, roles.staff, roles.driver] as string[];
+
+      if (!validRoles.includes(requestedRole)) {
+        return response.status(400).json({
+          message: "Invalid role filter",
+        });
+      }
+
+      values.push(requestedRole);
+      conditions.push(`role = $${values.length}`);
+    }
+
+    if (typeof requestedSearch === "string" && requestedSearch.trim().length > 0) {
+      values.push(`%${requestedSearch.trim()}%`);
+      conditions.push(`(name ILIKE $${values.length} OR email ILIKE $${values.length})`);
+    }
+
+    const whereClause = conditions.length > 0
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
+
+    const offset = (page - 1) * limit;
+    const dataValues = [...values, limit, offset];
+    const limitParameter = values.length + 1;
+    const offsetParameter = values.length + 2;
+
+    const [usersResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT id, name, email, role, created_at
+         FROM users
+         ${whereClause}
+         ORDER BY created_at DESC
+         LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
+        dataValues
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM users
+         ${whereClause}`,
+        values
+      ),
+    ]);
+
+    const total = countResult.rows[0].total;
+    const authenticatedRequest = request as AuthenticatedRequest;
+await recordAuditLog({
+  actorUserId: authenticatedRequest.user!.userId,
+  action: "user.created",
+  targetUserId: user.id,
+  metadata: {
+    role: user.role,
+  },
+});
+
+    return response.status(200).json({
+      users: usersResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+      filters: {
+        role: typeof requestedRole === "string" ? requestedRole : null,
+        search: typeof requestedSearch === "string" ? requestedSearch.trim() : null,
+      },
+    });
+  })
+);
+app.patch(
+  "/admin/users/:userId/status",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const userId = request.params.userId;
+    if (!userId || typeof userId !== "string") {
+      return response.status(400).json({ message: "Invalid user ID" });
+    }
+    const validation = userStatusSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid status data",
+        errors: validation.error.flatten(),
+      });
+    }
+    const result = await pool.query(
+      `UPDATE users
+       SET is_active = $1
+       WHERE id = $2
+       RETURNING id, name, email, role, is_active, created_at`,
+      [validation.data.isActive, userId]
+    );
+    const user = result.rows[0];
+    const authenticatedRequest = request as AuthenticatedRequest;
+await recordAuditLog({
+  actorUserId: authenticatedRequest.user!.userId,
+  action: "user.status_updated",
+  targetUserId: user.id,
+  metadata: {
+    isActive: user.is_active,
+  },
+});
+    if (!user) {
+      return response.status(404).json({ message: "User not found" });
+    }
+    return response.status(200).json({
+      message: "User status updated",
+      user,
+    });
+  })
+);
+app.patch(
+  "/admin/users/:userId/role",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const userId = request.params.userId;
+    if (!userId || typeof userId !== "string") {
+      return response.status(400).json({ message: "Invalid user ID" });
+    }
+    const validation = userRoleSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid role data",
+        errors: validation.error.flatten(),
+      });
+    }
+    const result = await pool.query(
+      `UPDATE users
+       SET role = $1
+       WHERE id = $2
+       RETURNING id, name, email, role, is_active, created_at`,
+      [validation.data.role, userId]
+    );
+    const user = result.rows[0];
+    const authenticatedRequest = request as AuthenticatedRequest;
+await recordAuditLog({
+  actorUserId: authenticatedRequest.user!.userId,
+  action: "user.role_updated",
+  targetUserId: user.id,
+  metadata: {
+    role: user.role,
+  },
+});
+    if (!user) {
+      return response.status(404).json({ message: "User not found" });
+    }
+    return response.status(200).json({
+      message: "User role updated",
+      user,
+    });
+  })
+);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

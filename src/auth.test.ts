@@ -40,15 +40,16 @@ after(async () => {
 });
 
 describe("authentication", () => {
-  it("registers a test user", async () => {
+   it("registers a test user", async () => {
     const response = await post("/auth/register", {
       name: "Lesson Test User",
       email: testEmail,
       password: testPassword,
-      role: "staff",
     });
+    const body = await response.json();
 
     assert.equal(response.status, 201);
+    assert.equal(body.user.role, "staff");
   });
 
   it("logs in and returns a JWT", async () => {
@@ -87,4 +88,13 @@ describe("authentication", () => {
 
     assert.equal(response.status, 200);
   });
+    it("denies non-admins from listing users", async () => {
+    const response = await fetch(`${baseUrl}/admin/users`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    assert.equal(response.status, 403);
+  });
+  
 });
+  
