@@ -14,3 +14,6 @@ export const tripRequestDecisionSchema = z.object({
 export const tripAssignmentSchema = z.object({
   driverId: z.string().uuid(),
 });
+export const tripProgressSchema = z.object({
+  status: z.enum(["in_progress", "completed"]),
+});

@@ -1,6 +1,6 @@
 import express from "express";
 import type { Request, Response } from "express";
-import { tripRequestSchema } from "./schemas/trip";
+import { tripRequestSchema, tripProgressSchema } from "./schemas/trip";
 import { pool, withTransaction } from "./db";
 import { requireRole } from "./middleware/require-role";
 import { authenticate, type AuthenticatedRequest } from "./middleware/authenticate";
@@ -18,7 +18,9 @@ import { roles } from "./middleware/roles";
 import { recordAuditLog } from "./audit-log";
 import { tripRequestDecisionSchema } from "./schemas/trip";
 import { tripAssignmentSchema } from "./schemas/trip";
+import { recordTripStatusChange } from "./trip-history";
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const app = express();
 
@@ -73,6 +75,7 @@ app.get(
     response.status(200).json({ message: "Fleet summary access granted" });
   }
 );
+
 app.get(
   "/trip-requests",
   authenticate,
@@ -118,6 +121,184 @@ app.get(
     });
   })
 );
+
+app.get(
+  "/driver/trip-requests",
+  authenticate,
+  requireRole(roles.driver),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const driverId = authenticatedRequest.user!.userId;
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const offset = (page - 1) * limit;
+    const [tripsResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT tr.id, tr.purpose, tr.origin, tr.destination,
+                tr.pickup_time, tr.passengers, tr.requested_by,
+                tr.department, tr.status, tr.driver_id,
+                tr.assigned_at, tr.created_at,
+                u.name AS requester_name,
+                u.email AS requester_email
+         FROM trip_requests tr
+        JOIN users u ON u.id::text = tr.requested_by
+         WHERE tr.driver_id = $1
+         ORDER BY tr.pickup_time ASC
+         LIMIT $2 OFFSET $3`,
+        [driverId, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM trip_requests
+         WHERE driver_id = $1`,
+        [driverId]
+      ),
+    ]);
+    const total = countResult.rows[0].total;
+    return response.status(200).json({
+      tripRequests: tripsResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  })
+);
+
+app.patch(
+  "/driver/trip-requests/:tripId/status",
+  authenticate,
+  requireRole(roles.driver),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const driverId = authenticatedRequest.user!.userId;
+    const tripId = request.params.tripId;
+
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const validation = tripProgressSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid trip progress",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const currentStatus = validation.data.status === "in_progress"
+      ? "assigned"
+      : "in_progress";
+
+    const result = await pool.query(
+      `UPDATE trip_requests
+       SET status = $1
+       WHERE id = $2
+         AND driver_id = $3
+         AND status = $4
+       RETURNING id, purpose, origin, destination, pickup_time,
+                 passengers, requested_by, department, status,
+                 driver_id, assigned_at, created_at`,
+      [validation.data.status, tripId, driverId, currentStatus]
+    );
+
+    const tripRequest = result.rows[0];
+
+    if (!tripRequest) {
+      const existing = await pool.query(
+        `SELECT id, driver_id, status
+         FROM trip_requests
+         WHERE id = $1`,
+        [tripId]
+      );
+
+      if (!existing.rows[0]) {
+        return response.status(404).json({ message: "Trip request not found" });
+      }
+
+      if (existing.rows[0].driver_id !== driverId) {
+        return response.status(403).json({ message: "Trip is assigned to another driver" });
+      }
+
+      return response.status(409).json({
+        message: `Trip must be ${currentStatus} before this update`,
+        status: existing.rows[0].status,
+      });
+    }
+
+    return response.status(200).json({
+      message: "Trip progress updated",
+      tripRequest,
+    });
+  })
+);
+app.get(
+  "/trip-requests/:tripId",
+  authenticate,
+  requireRole(roles.admin, roles.staff, roles.driver),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const user = authenticatedRequest.user!;
+    const tripId = request.params.tripId;
+
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const result = await pool.query(
+      `SELECT tr.id, tr.purpose, tr.origin, tr.destination,
+              tr.pickup_time, tr.passengers, tr.requested_by,
+              tr.department, tr.status, tr.driver_id,
+              tr.assigned_at, tr.created_at,
+              requester.name AS requester_name,
+              requester.email AS requester_email,
+              driver.name AS driver_name,
+              driver.email AS driver_email
+       FROM trip_requests tr
+       JOIN users requester ON requester.id::text = tr.requested_by
+       LEFT JOIN users driver ON driver.id = tr.driver_id
+       WHERE tr.id = $1
+         AND (
+           $2 = 'admin'
+           OR ( $2 = 'staff' AND tr.requested_by = $3 )
+           OR ( $2 = 'driver' AND tr.driver_id = $3::uuid )
+         )`,
+      [tripId, user.role, user.userId]
+    );
+
+    const tripRequest = result.rows[0];
+
+    if (!tripRequest) {
+      return response.status(404).json({ message: "Trip request not found" });
+    }
+
+    const historyResult = await pool.query(
+      `SELECT h.id, h.previous_status, h.new_status,
+              h.note, h.created_at,
+              u.name AS changed_by_name
+       FROM trip_request_status_history h
+       LEFT JOIN users u ON u.id = h.changed_by
+       WHERE h.trip_request_id = $1
+       ORDER BY h.created_at ASC`,
+      [tripRequest.id]
+    );
+
+    return response.status(200).json({
+      tripRequest,
+      statusHistory: historyResult.rows,
+    });
+  })
+);
+
 app.post(
   "/trip-requests",
   authenticate,
@@ -154,10 +335,80 @@ app.post(
           "pending",
         ]
       );
-      return result.rows[0];
+      const created = result.rows[0];
+
+      await recordTripStatusChange(client, {
+        tripRequestId: created.id,
+        changedBy: authenticatedRequest.user!.userId,
+        previousStatus: undefined,
+        newStatus: "pending",
+        note: "Trip request created",
+      });
+
+      return created;
     });
 
     response.status(201).json({ message: "Trip request created", tripRequest });
+  })
+);
+app.patch(
+  "/trip-requests/:tripId/cancel",
+  authenticate,
+  requireRole(roles.admin, roles.staff),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const userId = authenticatedRequest.user!.userId;
+    const tripId = request.params.tripId;
+    const isAdmin = authenticatedRequest.user!.role === roles.admin;
+
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const allowedStates = isAdmin
+      ? ["pending", "approved", "assigned"]
+      : ["pending"];
+
+    const result = await pool.query(
+      `UPDATE trip_requests
+       SET status = 'cancelled'
+       WHERE id = $1
+         AND status = ANY($2::text[])
+         AND ($3::boolean = TRUE OR requested_by = $4)
+       RETURNING id, purpose, origin, destination, pickup_time,
+                 passengers, requested_by, department, status,
+                 driver_id, assigned_at, created_at`,
+      [tripId, allowedStates, isAdmin, userId]
+    );
+
+    const tripRequest = result.rows[0];
+
+    if (!tripRequest) {
+      const existing = await pool.query(
+        `SELECT id, requested_by, status
+         FROM trip_requests
+         WHERE id = $1`,
+        [tripId]
+      );
+
+      if (!existing.rows[0]) {
+        return response.status(404).json({ message: "Trip request not found" });
+      }
+
+      if (!isAdmin && existing.rows[0].requested_by !== userId) {
+        return response.status(403).json({ message: "You cannot cancel this trip request" });
+      }
+
+      return response.status(409).json({
+        message: "Trip request cannot be cancelled from its current state",
+        status: existing.rows[0].status,
+      });
+    }
+
+    return response.status(200).json({
+      message: "Trip request cancelled",
+      tripRequest,
+    });
   })
 );
 
@@ -312,6 +563,7 @@ app.post(
     });
   })
 );
+
 app.get(
   "/admin/trip-requests",
   authenticate,
@@ -360,7 +612,7 @@ app.get(
                 u.name AS requester_name,
                 u.email AS requester_email
          FROM trip_requests tr
-         JOIN users u ON u.id = tr.requested_by
+        JOIN users u ON u.id::text = tr.requested_by
          ${whereClause}
          ORDER BY tr.created_at DESC
          LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
@@ -571,13 +823,15 @@ app.patch(
     });
   })
 );
+
 app.patch(
   "/admin/trip-requests/:tripId/status",
   authenticate,
   requireRole(roles.admin),
   asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
     const tripId = request.params.tripId;
-    if (!tripId || typeof tripId !== "string") {
+    if (!UUID_PATTERN.test(tripId)) {
       return response.status(400).json({ message: "Invalid trip ID" });
     }
     const validation = tripRequestDecisionSchema.safeParse(request.body);
@@ -587,20 +841,33 @@ app.patch(
         errors: validation.error.flatten(),
       });
     }
-    const result = await pool.query(
-      `UPDATE trip_requests
-       SET status = $1
-       WHERE id = $2 AND status = 'pending'
-       RETURNING id, purpose, origin, destination, pickup_time,
-                 passengers, requested_by, department, status, created_at`,
-      [validation.data.status, tripId]
-    );
-    const tripRequest = result.rows[0];
+
+    const tripRequest = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE trip_requests
+         SET status = $1
+         WHERE id = $2 AND status = 'pending'
+         RETURNING id, purpose, origin, destination, pickup_time,
+                   passengers, requested_by, department, status, created_at`,
+        [validation.data.status, tripId]
+      );
+      const updated = result.rows[0];
+      if (!updated) return null;
+
+      await recordTripStatusChange(client, {
+        tripRequestId: updated.id,
+        changedBy: authenticatedRequest.user!.userId,
+        previousStatus: "pending",
+        newStatus: updated.status,
+        note: "Trip request decision recorded",
+      });
+
+      return updated;
+    });
+
     if (!tripRequest) {
       const existing = await pool.query(
-        `SELECT id, status
-         FROM trip_requests
-         WHERE id = $1`,
+        `SELECT id, status FROM trip_requests WHERE id = $1`,
         [tripId]
       );
       if (!existing.rows[0]) {
@@ -611,20 +878,23 @@ app.patch(
         status: existing.rows[0].status,
       });
     }
+
     return response.status(200).json({
       message: `Trip request ${validation.data.status}`,
       tripRequest,
     });
   })
 );
+
 app.patch(
   "/admin/trip-requests/:tripId/assign",
   authenticate,
   requireRole(roles.admin),
   asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
     const tripId = request.params.tripId;
 
-    if (!tripId || typeof tripId !== "string") {
+    if (!UUID_PATTERN.test(tripId)) {
       return response.status(400).json({ message: "Invalid trip ID" });
     }
 
@@ -656,32 +926,40 @@ app.patch(
       });
     }
 
-    const tripResult = await pool.query(
-      `UPDATE trip_requests
-       SET driver_id = $1,
-           assigned_at = NOW(),
-           status = 'assigned'
-       WHERE id = $2 AND status = 'approved'
-       RETURNING id, purpose, origin, destination, pickup_time,
-                 passengers, requested_by, department, status,
-                 driver_id, assigned_at, created_at`,
-      [driver.id, tripId]
-    );
+    const tripRequest = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE trip_requests
+         SET driver_id = $1,
+             assigned_at = NOW(),
+             status = 'assigned'
+         WHERE id = $2 AND status = 'approved'
+         RETURNING id, purpose, origin, destination, pickup_time,
+                   passengers, requested_by, department, status,
+                   driver_id, assigned_at, created_at`,
+        [driver.id, tripId]
+      );
+      const updated = result.rows[0];
+      if (!updated) return null;
 
-    const tripRequest = tripResult.rows[0];
+      await recordTripStatusChange(client, {
+        tripRequestId: updated.id,
+        changedBy: authenticatedRequest.user!.userId,
+        previousStatus: "approved",
+        newStatus: "assigned",
+        note: `Assigned to ${driver.name}`,
+      });
+
+      return updated;
+    });
 
     if (!tripRequest) {
       const existing = await pool.query(
-        `SELECT id, status
-         FROM trip_requests
-         WHERE id = $1`,
+        `SELECT id, status FROM trip_requests WHERE id = $1`,
         [tripId]
       );
-
       if (!existing.rows[0]) {
         return response.status(404).json({ message: "Trip request not found" });
       }
-
       return response.status(409).json({
         message: "Only approved trip requests can be assigned",
         status: existing.rows[0].status,
