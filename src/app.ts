@@ -20,6 +20,11 @@ import { tripRequestDecisionSchema } from "./schemas/trip";
 import { tripAssignmentSchema } from "./schemas/trip";
 import { recordTripStatusChange } from "./trip-history";
 import { vehicleCreationSchema } from "./schemas/vehicle";
+import { vehicleStatusSchema } from "./schemas/vehicle";
+import { vehicleAssignmentSchema } from "./schemas/trip";
+import { vehicleHasConflict, driverHasConflict } from "./scheduling";
+
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const app = express();
@@ -318,35 +323,36 @@ app.post(
     const trip = validation.data;
 
     const tripRequest = await withTransaction(async (client) => {
-      const result = await client.query(
-        `INSERT INTO trip_requests
-           (purpose, origin, destination, pickup_time, passengers, requested_by, department, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id, purpose, origin, destination, pickup_time, passengers,
-                   requested_by, department, status, created_at`,
-        [
-          trip.purpose,
-          trip.origin,
-          trip.destination,
-          trip.pickupTime,
-          trip.passengers,
-          authenticatedRequest.user.userId,
-          trip.department,
-          "pending",
-        ]
-      );
-      const created = result.rows[0];
+  const result = await client.query(
+    `INSERT INTO trip_requests
+       (purpose, origin, destination, pickup_time, passengers, requested_by, department, status, duration_minutes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING id, purpose, origin, destination, pickup_time, passengers,
+               requested_by, department, status, duration_minutes, created_at`,
+    [
+      trip.purpose,
+      trip.origin,
+      trip.destination,
+      trip.pickupTime,
+      trip.passengers,
+      authenticatedRequest.user.userId,
+      trip.department,
+      "pending",
+      trip.durationMinutes,
+    ]
+  );
+  const created = result.rows[0];
 
-      await recordTripStatusChange(client, {
-        tripRequestId: created.id,
-        changedBy: authenticatedRequest.user!.userId,
-        previousStatus: undefined,
-        newStatus: "pending",
-        note: "Trip request created",
-      });
+  await recordTripStatusChange(client, {
+    tripRequestId: created.id,
+    changedBy: authenticatedRequest.user!.userId,
+    previousStatus: undefined,
+    newStatus: "pending",
+    note: "Trip request created",
+  });
 
-      return created;
-    });
+  return created;
+});
 
     response.status(201).json({ message: "Trip request created", tripRequest });
   })
@@ -697,6 +703,77 @@ app.get(
   })
 );
 app.get(
+  "/admin/vehicles",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const requestedStatus = request.query.status;
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const allowedStatuses = [
+      "available",
+      "assigned",
+      "maintenance",
+      "inactive",
+    ];
+    if (
+      typeof requestedStatus === "string" &&
+      !allowedStatuses.includes(requestedStatus)
+    ) {
+      return response.status(400).json({ message: "Invalid vehicle status filter" });
+    }
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    if (typeof requestedStatus === "string" && requestedStatus.length > 0) {
+      values.push(requestedStatus);
+      conditions.push(`status = $${values.length}`);
+    }
+    const whereClause = conditions.length > 0
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
+    const offset = (page - 1) * limit;
+    const limitParameter = values.length + 1;
+    const offsetParameter = values.length + 2;
+    const [vehiclesResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT id, registration_number, make, model,
+                manufacture_year, capacity, status,
+                created_at, updated_at
+         FROM vehicles
+         ${whereClause}
+         ORDER BY registration_number ASC
+         LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
+        [...values, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM vehicles
+         ${whereClause}`,
+        values
+      ),
+    ]);
+    const total = countResult.rows[0].total;
+    return response.status(200).json({
+      vehicles: vehiclesResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+      filters: {
+        status: typeof requestedStatus === "string" ? requestedStatus : null,
+      },
+    });
+  })
+);
+app.get(
   "/admin/trip-requests/:tripId/history",
   authenticate,
   requireRole(roles.admin),
@@ -787,6 +864,65 @@ app.post(
     return response.status(201).json({
       message: "Vehicle created",
       vehicle: result.rows[0],
+    });
+  })
+);
+app.patch(
+  "/admin/vehicles/:vehicleId/status",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const vehicleId = request.params.vehicleId;
+
+    if (!UUID_PATTERN.test(vehicleId)) {
+      return response.status(400).json({ message: "Invalid vehicle ID" });
+    }
+
+    const validation = vehicleStatusSchema.safeParse(request.body);
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid vehicle status",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const requestedStatus = validation.data.status;
+
+    if (["maintenance", "inactive"].includes(requestedStatus)) {
+      const activeAssignment = await pool.query(
+        `SELECT id
+         FROM trip_requests
+         WHERE driver_id IS NOT NULL
+           AND status IN ('assigned', 'in_progress')
+           AND vehicle_id = $1
+         LIMIT 1`,
+        [vehicleId]
+      );
+      if (activeAssignment.rows[0]) {
+        return response.status(409).json({
+          message: "Vehicle has an active trip assignment",
+        });
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE vehicles
+       SET status = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, registration_number, make, model,
+                 manufacture_year, capacity, status,
+                 created_at, updated_at`,
+      [requestedStatus, vehicleId]
+    );
+
+    const vehicle = result.rows[0];
+    if (!vehicle) {
+      return response.status(404).json({ message: "Vehicle not found" });
+    }
+
+    return response.status(200).json({
+      message: "Vehicle status updated",
+      vehicle,
     });
   })
 );
@@ -1075,8 +1211,32 @@ app.patch(
       });
     }
 
-    const tripRequest = await withTransaction(async (client) => {
-      const result = await client.query(
+    const assignment = await withTransaction(async (client) => {
+      const tripResult = await client.query(
+        `SELECT id, pickup_time, duration_minutes, status
+         FROM trip_requests
+         WHERE id = $1
+         FOR UPDATE`,
+        [tripId]
+      );
+
+      const trip = tripResult.rows[0];
+
+      if (!trip) {
+        return { error: "trip_not_found" as const };
+      }
+
+      if (trip.status !== "approved") {
+        return { error: "trip_not_approved" as const, status: trip.status };
+      }
+
+      if (
+        await driverHasConflict(client, driver.id, trip.pickup_time, trip.duration_minutes, trip.id)
+      ) {
+        return { error: "driver_schedule_conflict" as const };
+      }
+
+      const updateResult = await client.query(
         `UPDATE trip_requests
          SET driver_id = $1,
              assigned_at = NOW(),
@@ -1087,8 +1247,8 @@ app.patch(
                    driver_id, assigned_at, created_at`,
         [driver.id, tripId]
       );
-      const updated = result.rows[0];
-      if (!updated) return null;
+      const updated = updateResult.rows[0];
+      if (!updated) return { error: "trip_not_approved" as const, status: trip.status };
 
       await recordTripStatusChange(client, {
         tripRequestId: updated.id,
@@ -1098,27 +1258,189 @@ app.patch(
         note: `Assigned to ${driver.name}`,
       });
 
-      return updated;
+      return { tripRequest: updated };
     });
 
-    if (!tripRequest) {
-      const existing = await pool.query(
-        `SELECT id, status FROM trip_requests WHERE id = $1`,
-        [tripId]
-      );
-      if (!existing.rows[0]) {
+    if ("error" in assignment) {
+      if (assignment.error === "trip_not_found") {
         return response.status(404).json({ message: "Trip request not found" });
+      }
+      if (assignment.error === "driver_schedule_conflict") {
+        return response.status(409).json({
+          message: "Driver is already scheduled for an overlapping trip",
+        });
       }
       return response.status(409).json({
         message: "Only approved trip requests can be assigned",
-        status: existing.rows[0].status,
+        status: assignment.status,
       });
     }
 
     return response.status(200).json({
       message: "Trip request assigned",
-      tripRequest,
+      tripRequest: assignment.tripRequest,
       driver,
+    });
+  })
+);
+app.patch(
+  "/admin/trip-requests/:tripId/vehicle",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const tripId = request.params.tripId;
+
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const validation = vehicleAssignmentSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid vehicle assignment",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const assignment = await withTransaction(async (client) => {
+      const tripResult = await client.query(
+  `SELECT id, passengers, pickup_time, duration_minutes, status, vehicle_id
+   FROM trip_requests
+   WHERE id = $1
+   FOR UPDATE`,
+  [tripId]
+);
+
+      const trip = tripResult.rows[0];
+
+      if (!trip) {
+        return { error: "trip_not_found" as const };
+      }
+
+      if (trip.status !== "approved") {
+        return {
+          error: "trip_not_approved" as const,
+          status: trip.status,
+        };
+      }
+
+      if (trip.vehicle_id) {
+        return { error: "trip_already_has_vehicle" as const };
+      }
+
+      const vehicleResult = await client.query(
+        `SELECT id, registration_number, make, model,
+                capacity, status
+         FROM vehicles
+         WHERE id = $1
+         FOR UPDATE`,
+        [validation.data.vehicleId]
+      );
+
+      const vehicle = vehicleResult.rows[0];
+
+      if (!vehicle) {
+        return { error: "vehicle_not_found" as const };
+      }
+
+      if (vehicle.status !== "available") {
+        return {
+          error: "vehicle_unavailable" as const,
+          status: vehicle.status,
+        };
+      }
+
+      if (vehicle.capacity < trip.passengers) {
+        return {
+          error: "vehicle_capacity_too_small" as const,
+          capacity: vehicle.capacity,
+          passengers: trip.passengers,
+        };
+      }
+      if (
+  await vehicleHasConflict(
+    client,
+    vehicle.id,
+    trip.pickup_time,
+    trip.duration_minutes,
+    trip.id
+  )
+) {
+  return { error: "vehicle_schedule_conflict" as const };
+}
+
+      const conflictResult = await client.query(
+        `SELECT id
+         FROM trip_requests
+         WHERE vehicle_id = $1
+           AND status IN ('assigned', 'in_progress')
+         LIMIT 1
+         FOR UPDATE`,
+        [vehicle.id]
+      );
+
+      if (conflictResult.rows[0]) {
+        return { error: "vehicle_has_active_trip" as const };
+      }
+
+      const updatedTripResult = await client.query(
+        `UPDATE trip_requests
+         SET vehicle_id = $1
+         WHERE id = $2 AND status = 'approved'
+         RETURNING id, purpose, origin, destination, pickup_time,
+                   passengers, requested_by, department, status,
+                   vehicle_id, driver_id, created_at`,
+        [vehicle.id, tripId]
+      );
+
+      await client.query(
+        `UPDATE vehicles
+         SET status = 'assigned', updated_at = NOW()
+         WHERE id = $1`,
+        [vehicle.id]
+      );
+
+      return {
+        tripRequest: updatedTripResult.rows[0],
+        vehicle,
+      };
+    });
+
+    if ("error" in assignment) {
+      if (assignment.error === "trip_not_found" || assignment.error === "vehicle_not_found") {
+        return response.status(404).json({ message: "Trip request or vehicle not found" });
+      }
+      if (assignment.error === "vehicle_schedule_conflict") {
+  return response.status(409).json({
+    message: "Vehicle is already scheduled for an overlapping trip",
+  });
+}
+
+      if (assignment.error === "trip_not_approved") {
+        return response.status(409).json({
+          message: "Only approved trip requests can receive a vehicle",
+          status: assignment.status,
+        });
+      }
+
+      if (assignment.error === "vehicle_capacity_too_small") {
+        return response.status(409).json({
+          message: "Vehicle capacity is too small for this trip",
+          capacity: assignment.capacity,
+          passengers: assignment.passengers,
+        });
+      }
+
+      return response.status(409).json({
+        message: "Vehicle is unavailable or already assigned",
+      });
+    }
+
+    return response.status(200).json({
+      message: "Vehicle assigned to trip request",
+      tripRequest: assignment.tripRequest,
+      vehicle: assignment.vehicle,
     });
   })
 );
