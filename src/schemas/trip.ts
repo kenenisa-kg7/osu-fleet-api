@@ -21,3 +21,7 @@ export const tripRequestSchema = z.object({
   department: z.string().min(1),
   durationMinutes: z.number().int().positive().max(1440).default(60),
 });
+export const tripCompletionSchema = z.object({
+  endMileage: z.number().int().nonnegative(),
+  completionNotes: z.string().trim().max(2000).optional(),
+});

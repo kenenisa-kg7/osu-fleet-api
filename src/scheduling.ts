@@ -12,8 +12,8 @@ export async function vehicleHasConflict(
      FROM trip_requests
      WHERE vehicle_id = $1
        AND status IN ('assigned', 'in_progress')
-       AND pickup_time < $2 + ($3 * INTERVAL '1 minute')
-       AND pickup_time + (duration_minutes * INTERVAL '1 minute') > $2
+       AND pickup_time < $2::timestamptz + ($3::integer * INTERVAL '1 minute')
+       AND pickup_time + (duration_minutes * INTERVAL '1 minute') > $2::timestamptz
        AND ($4::uuid IS NULL OR id <> $4::uuid)
      LIMIT 1`,
     [vehicleId, pickupTime, durationMinutes, excludeTripId ?? null]
@@ -34,8 +34,8 @@ export async function driverHasConflict(
      FROM trip_requests
      WHERE driver_id = $1
        AND status IN ('assigned', 'in_progress')
-       AND pickup_time < $2 + ($3 * INTERVAL '1 minute')
-       AND pickup_time + (duration_minutes * INTERVAL '1 minute') > $2
+       AND pickup_time < $2::timestamptz + ($3::integer * INTERVAL '1 minute')
+       AND pickup_time + (duration_minutes * INTERVAL '1 minute') > $2::timestamptz
        AND ($4::uuid IS NULL OR id <> $4::uuid)
      LIMIT 1`,
     [driverId, pickupTime, durationMinutes, excludeTripId ?? null]

@@ -11,3 +11,10 @@ export const vehicleCreationSchema = z.object({
 export const vehicleStatusSchema = z.object({
   status: z.enum(["available", "maintenance", "inactive"]),
 });
+export const maintenanceRecordSchema = z.object({
+  maintenanceType: z.enum(["inspection", "service", "repair", "accident"]),
+  description: z.string().trim().min(3).max(1000),
+  performedAt: z.coerce.date(),
+  mileage: z.number().int().nonnegative().optional(),
+  cost: z.number().nonnegative().optional(),
+});

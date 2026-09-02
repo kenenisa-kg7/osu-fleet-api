@@ -23,7 +23,10 @@ import { vehicleCreationSchema } from "./schemas/vehicle";
 import { vehicleStatusSchema } from "./schemas/vehicle";
 import { vehicleAssignmentSchema } from "./schemas/trip";
 import { vehicleHasConflict, driverHasConflict } from "./scheduling";
-
+import { maintenanceRecordSchema } from "./schemas/vehicle";
+import { tripCompletionSchema } from "./schemas/trip";
+import { z } from "zod";
+import { createNotification } from "./notifications";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -243,6 +246,118 @@ app.patch(
     return response.status(200).json({
       message: "Trip progress updated",
       tripRequest,
+    });
+  })
+);
+app.patch(
+  "/driver/trip-requests/:tripId/complete",
+  authenticate,
+  requireRole(roles.driver),
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const driverId = authenticatedRequest.user!.userId;
+    const tripId = request.params.tripId;
+
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const validation = tripCompletionSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid completion data",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const result = await withTransaction(async (client) => {
+      const tripResult = await client.query(
+        `SELECT id, driver_id, vehicle_id, status, start_mileage
+         FROM trip_requests
+         WHERE id = $1
+         FOR UPDATE`,
+        [tripId]
+      );
+
+      const trip = tripResult.rows[0];
+
+      if (!trip) {
+        return { error: "not_found" as const };
+      }
+
+      if (trip.driver_id !== driverId) {
+        return { error: "not_assigned_to_driver" as const };
+      }
+
+      if (trip.status !== "in_progress") {
+        return {
+          error: "invalid_status" as const,
+          status: trip.status,
+        };
+      }
+
+      if (
+        trip.start_mileage !== null &&
+        validation.data.endMileage < trip.start_mileage
+      ) {
+        return { error: "mileage_decreased" as const };
+      }
+
+      const updatedTripResult = await client.query(
+        `UPDATE trip_requests
+         SET status = 'completed',
+             end_mileage = $1,
+             completion_notes = $2,
+             completed_at = NOW()
+         WHERE id = $3
+         RETURNING id, purpose, origin, destination, pickup_time,
+                   passengers, requested_by, department, status,
+                   vehicle_id, driver_id, start_mileage,
+                   end_mileage, completion_notes, completed_at, created_at`,
+        [
+          validation.data.endMileage,
+          validation.data.completionNotes ?? null,
+          tripId,
+        ]
+      );
+
+      if (trip.vehicle_id) {
+        await client.query(
+          `UPDATE vehicles
+           SET status = 'available', updated_at = NOW()
+           WHERE id = $1 AND status = 'assigned'`,
+          [trip.vehicle_id]
+        );
+      }
+
+      return { tripRequest: updatedTripResult.rows[0] };
+    });
+
+    if (result.error === "not_found") {
+      return response.status(404).json({ message: "Trip request not found" });
+    }
+
+    if (result.error === "not_assigned_to_driver") {
+      return response.status(403).json({ message: "Trip is assigned to another driver" });
+    }
+
+    if (result.error === "invalid_status") {
+      return response.status(409).json({
+        message: "Only in-progress trips can be completed",
+        status: result.status,
+      });
+    }
+
+    if (result.error === "mileage_decreased") {
+      return response.status(400).json({
+        message: "End mileage cannot be less than start mileage",
+      });
+    }
+
+    return response.status(200).json({
+      message: "Trip completed",
+      tripRequest: result.tripRequest,
     });
   })
 );
@@ -830,6 +945,7 @@ app.get(
     });
   })
 );
+
 app.post(
   "/admin/vehicles",
   authenticate,
@@ -864,6 +980,101 @@ app.post(
     return response.status(201).json({
       message: "Vehicle created",
       vehicle: result.rows[0],
+    });
+  })
+);
+app.post(
+  "/admin/vehicles/:vehicleId/maintenance",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const vehicleId = request.params.vehicleId;
+
+    if (!UUID_PATTERN.test(vehicleId)) {
+      return response.status(400).json({ message: "Invalid vehicle ID" });
+    }
+
+    const validation = maintenanceRecordSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid maintenance record",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const authenticatedRequest = request as AuthenticatedRequest;
+
+    const vehicleResult = await pool.query(
+      `SELECT id, registration_number
+       FROM vehicles
+       WHERE id = $1`,
+      [vehicleId]
+    );
+
+    if (!vehicleResult.rows[0]) {
+      return response.status(404).json({ message: "Vehicle not found" });
+    }
+    const maintenance = validation.data;
+    const maintenanceRecord = await withTransaction(async (client) => {
+      const result = await client.query(
+        `INSERT INTO vehicle_maintenance_records
+           (vehicle_id, maintenance_type, description, performed_at,
+            mileage, cost, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, vehicle_id, maintenance_type, description,
+                   performed_at, mileage, cost, created_by, created_at`,
+        [
+          vehicleId,
+          maintenance.maintenanceType,
+          maintenance.description,
+          maintenance.performedAt,
+          maintenance.mileage ?? null,
+          maintenance.cost ?? null,
+          authenticatedRequest.user!.userId,
+        ]
+      );
+      const record = result.rows[0];
+      if (["repair", "accident"].includes(maintenance.maintenanceType)) {
+        await client.query(
+          `UPDATE vehicles
+           SET status = 'maintenance', updated_at = NOW()
+           WHERE id = $1
+             AND status <> 'assigned'`,
+          [vehicleId]
+        );
+      }
+      return record;
+    });
+    return response.status(201).json({
+      message: "Maintenance record created",
+      maintenanceRecord,
+    });
+  })
+);
+app.get(
+  "/admin/vehicles/:vehicleId/maintenance",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const vehicleId = request.params.vehicleId;
+
+    if (!UUID_PATTERN.test(vehicleId)) {
+      return response.status(400).json({ message: "Invalid vehicle ID" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, vehicle_id, maintenance_type, description,
+              performed_at, mileage, cost, created_by, created_at
+       FROM vehicle_maintenance_records
+       WHERE vehicle_id = $1
+       ORDER BY performed_at DESC`,
+      [vehicleId]
+    );
+
+    return response.status(200).json({
+      vehicleId,
+      maintenanceRecords: result.rows,
     });
   })
 );
@@ -1139,14 +1350,20 @@ app.patch(
       const updated = result.rows[0];
       if (!updated) return null;
 
-      await recordTripStatusChange(client, {
+          await recordTripStatusChange(client, {
         tripRequestId: updated.id,
         changedBy: authenticatedRequest.user!.userId,
         previousStatus: "pending",
         newStatus: updated.status,
         note: "Trip request decision recorded",
       });
-
+      await createNotification(client, {
+        recipientUserId: updated.requested_by,
+        type: `trip_request_${updated.status}`,
+        title: `Trip request ${updated.status}`,
+        message: `Your trip request has been ${updated.status}.`,
+        tripRequestId: updated.id,
+      });
       return updated;
     });
 
@@ -1250,14 +1467,20 @@ app.patch(
       const updated = updateResult.rows[0];
       if (!updated) return { error: "trip_not_approved" as const, status: trip.status };
 
-      await recordTripStatusChange(client, {
+          await recordTripStatusChange(client, {
         tripRequestId: updated.id,
         changedBy: authenticatedRequest.user!.userId,
         previousStatus: "approved",
         newStatus: "assigned",
         note: `Assigned to ${driver.name}`,
       });
-
+      await createNotification(client, {
+        recipientUserId: driver.id,
+        type: "trip_assigned",
+        title: "Trip assigned",
+        message: "A trip has been assigned to you.",
+        tripRequestId: updated.id,
+      });
       return { tripRequest: updated };
     });
 
@@ -1441,6 +1664,68 @@ app.patch(
       message: "Vehicle assigned to trip request",
       tripRequest: assignment.tripRequest,
       vehicle: assignment.vehicle,
+    });
+  })
+);
+app.get(
+  "/notifications",
+  authenticate,
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const userId = authenticatedRequest.user!.userId;
+
+    const result = await pool.query(
+      `SELECT id, type, title, message,
+              related_trip_request_id, related_vehicle_id,
+              is_read, created_at
+       FROM notifications
+       WHERE recipient_user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+
+    const unreadResult = await pool.query(
+      `SELECT COUNT(*)::int AS unread
+       FROM notifications
+       WHERE recipient_user_id = $1 AND is_read = FALSE`,
+      [userId]
+    );
+
+    return response.status(200).json({
+      notifications: result.rows,
+      unreadCount: unreadResult.rows[0].unread,
+    });
+  })
+);
+
+app.patch(
+  "/notifications/:notificationId/read",
+  authenticate,
+  asyncHandler(async (request: Request, response: Response) => {
+    const authenticatedRequest = request as AuthenticatedRequest;
+    const userId = authenticatedRequest.user!.userId;
+    const notificationId = request.params.notificationId;
+
+    if (!UUID_PATTERN.test(notificationId)) {
+      return response.status(400).json({ message: "Invalid notification ID" });
+    }
+
+    const result = await pool.query(
+      `UPDATE notifications
+       SET is_read = TRUE
+       WHERE id = $1 AND recipient_user_id = $2
+       RETURNING id, is_read`,
+      [notificationId, userId]
+    );
+
+    if (!result.rows[0]) {
+      return response.status(404).json({ message: "Notification not found" });
+    }
+
+    return response.status(200).json({
+      message: "Notification marked as read",
+      notification: result.rows[0],
     });
   })
 );
