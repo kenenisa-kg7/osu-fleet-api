@@ -19,7 +19,7 @@ import { recordAuditLog } from "./audit-log";
 import { tripRequestDecisionSchema } from "./schemas/trip";
 import { tripAssignmentSchema } from "./schemas/trip";
 import { recordTripStatusChange } from "./trip-history";
-
+import { vehicleCreationSchema } from "./schemas/vehicle";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const app = express();
@@ -572,17 +572,25 @@ app.get(
     const requestedPage = Number(request.query.page ?? 1);
     const requestedLimit = Number(request.query.limit ?? 20);
     const requestedStatus = request.query.status;
+    const requestedDepartment = request.query.department;
+    const requestedDestination = request.query.destination;
+    const requestedRequester = request.query.requester;
+    const requestedFrom = request.query.from;
+    const requestedTo = request.query.to;
+
     const page = Number.isInteger(requestedPage) && requestedPage > 0
       ? requestedPage
       : 1;
     const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
       ? Math.min(requestedLimit, 100)
       : 20;
+
     const allowedStatuses = [
       "pending",
       "approved",
       "rejected",
       "assigned",
+      "in_progress",
       "completed",
       "cancelled",
     ];
@@ -592,18 +600,58 @@ app.get(
     ) {
       return response.status(400).json({ message: "Invalid trip status filter" });
     }
+
     const conditions: string[] = [];
     const values: unknown[] = [];
+
     if (typeof requestedStatus === "string" && requestedStatus.length > 0) {
       values.push(requestedStatus);
       conditions.push(`tr.status = $${values.length}`);
     }
+
+    if (typeof requestedDepartment === "string" && requestedDepartment.trim()) {
+      values.push(`%${requestedDepartment.trim()}%`);
+      conditions.push(`tr.department ILIKE $${values.length}`);
+    }
+
+    if (typeof requestedDestination === "string" && requestedDestination.trim()) {
+      values.push(`%${requestedDestination.trim()}%`);
+      conditions.push(`tr.destination ILIKE $${values.length}`);
+    }
+
+    if (typeof requestedRequester === "string" && requestedRequester.trim()) {
+      values.push(`%${requestedRequester.trim()}%`);
+      conditions.push(
+        `(u.name ILIKE $${values.length} OR u.email ILIKE $${values.length})`
+      );
+    }
+
+    if (typeof requestedFrom === "string" && requestedFrom.trim()) {
+      const fromDate = new Date(requestedFrom);
+      if (Number.isNaN(fromDate.getTime())) {
+        return response.status(400).json({ message: "Invalid from date" });
+      }
+      values.push(fromDate);
+      conditions.push(`tr.pickup_time >= $${values.length}`);
+    }
+
+    if (typeof requestedTo === "string" && requestedTo.trim()) {
+      const toDate = new Date(requestedTo);
+      if (Number.isNaN(toDate.getTime())) {
+        return response.status(400).json({ message: "Invalid to date" });
+      }
+      values.push(toDate);
+      conditions.push(`tr.pickup_time <= $${values.length}`);
+    }
+
     const whereClause = conditions.length > 0
       ? `WHERE ${conditions.join(" AND ")}`
       : "";
+
     const offset = (page - 1) * limit;
     const limitParameter = values.length + 1;
     const offsetParameter = values.length + 2;
+
     const [requestsResult, countResult] = await Promise.all([
       pool.query(
         `SELECT tr.id, tr.purpose, tr.origin, tr.destination,
@@ -612,7 +660,7 @@ app.get(
                 u.name AS requester_name,
                 u.email AS requester_email
          FROM trip_requests tr
-        JOIN users u ON u.id::text = tr.requested_by
+         JOIN users u ON u.id::text = tr.requested_by
          ${whereClause}
          ORDER BY tr.created_at DESC
          LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
@@ -621,11 +669,14 @@ app.get(
       pool.query(
         `SELECT COUNT(*)::int AS total
          FROM trip_requests tr
+         JOIN users u ON u.id::text = tr.requested_by
          ${whereClause}`,
         values
       ),
     ]);
+
     const total = countResult.rows[0].total;
+
     return response.status(200).json({
       tripRequests: requestsResult.rows,
       pagination: {
@@ -636,11 +687,109 @@ app.get(
       },
       filters: {
         status: typeof requestedStatus === "string" ? requestedStatus : null,
+        department: typeof requestedDepartment === "string" ? requestedDepartment.trim() : null,
+        destination: typeof requestedDestination === "string" ? requestedDestination.trim() : null,
+        requester: typeof requestedRequester === "string" ? requestedRequester.trim() : null,
+        from: typeof requestedFrom === "string" ? requestedFrom : null,
+        to: typeof requestedTo === "string" ? requestedTo : null,
       },
     });
   })
 );
+app.get(
+  "/admin/trip-requests/:tripId/history",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const tripId = request.params.tripId;
 
+    if (!UUID_PATTERN.test(tripId)) {
+      return response.status(400).json({ message: "Invalid trip ID" });
+    }
+
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const offset = (page - 1) * limit;
+
+    const [historyResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT h.id, h.trip_request_id, h.previous_status,
+                h.new_status, h.note, h.created_at,
+                u.id AS changed_by,
+                u.name AS changed_by_name,
+                u.email AS changed_by_email
+         FROM trip_request_status_history h
+         LEFT JOIN users u ON u.id = h.changed_by
+         WHERE h.trip_request_id = $1
+         ORDER BY h.created_at ASC
+         LIMIT $2 OFFSET $3`,
+        [tripId, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM trip_request_status_history
+         WHERE trip_request_id = $1`,
+        [tripId]
+      ),
+    ]);
+
+    const total = countResult.rows[0].total;
+
+    return response.status(200).json({
+      tripRequestId: tripId,
+      history: historyResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  })
+);
+app.post(
+  "/admin/vehicles",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const validation = vehicleCreationSchema.safeParse(request.body);
+
+    if (!validation.success) {
+      return response.status(400).json({
+        message: "Invalid vehicle data",
+        errors: validation.error.flatten(),
+      });
+    }
+
+    const vehicle = validation.data;
+
+    const result = await pool.query(
+      `INSERT INTO vehicles
+         (registration_number, make, model, manufacture_year, capacity)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, registration_number, make, model,
+                 manufacture_year, capacity, status, created_at, updated_at`,
+      [
+        vehicle.registrationNumber,
+        vehicle.make,
+        vehicle.model,
+        vehicle.manufactureYear ?? null,
+        vehicle.capacity,
+      ]
+    );
+
+    return response.status(201).json({
+      message: "Vehicle created",
+      vehicle: result.rows[0],
+    });
+  })
+);
 app.get(
   "/admin/users",
   authenticate,
