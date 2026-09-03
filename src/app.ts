@@ -79,9 +79,41 @@ app.get(
   "/admin/fleet-summary",
   authenticate,
   requireRole(roles.admin, roles.staff),
-  (_request, response) => {
-    response.status(200).json({ message: "Fleet summary access granted" });
-  }
+  asyncHandler(async (_request: Request, response: Response) => {
+    const [tripCounts, vehicleCounts, unreadCounts] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+          COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+          COUNT(*) FILTER (WHERE status = 'assigned')::int AS assigned,
+          COUNT(*) FILTER (WHERE status = 'in_progress')::int AS in_progress,
+          COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+          COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled
+        FROM trip_requests
+      `),
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status = 'available')::int AS available,
+          COUNT(*) FILTER (WHERE status = 'assigned')::int AS assigned,
+          COUNT(*) FILTER (WHERE status = 'maintenance')::int AS maintenance,
+          COUNT(*) FILTER (WHERE status = 'inactive')::int AS inactive
+        FROM vehicles
+      `),
+      pool.query(`
+        SELECT COUNT(*)::int AS unread
+        FROM notifications
+        WHERE is_read = FALSE
+      `),
+    ]);
+    return response.status(200).json({
+      generatedAt: new Date().toISOString(),
+      trips: tripCounts.rows[0],
+      vehicles: vehicleCounts.rows[0],
+      notifications: unreadCounts.rows[0],
+    });
+  })
 );
 
 app.get(
@@ -1726,6 +1758,50 @@ app.patch(
     return response.status(200).json({
       message: "Notification marked as read",
       notification: result.rows[0],
+    });
+  })
+);
+app.get(
+  "/admin/audit-logs",
+  authenticate,
+  requireRole(roles.admin),
+  asyncHandler(async (request: Request, response: Response) => {
+    const requestedPage = Number(request.query.page ?? 1);
+    const requestedLimit = Number(request.query.limit ?? 20);
+    const page = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 20;
+    const offset = (page - 1) * limit;
+
+    const [logsResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           al.id, al.actor_user_id, actor.name AS actor_name, actor.email AS actor_email,
+           al.action, al.target_user_id, target.name AS target_name, target.email AS target_email,
+           al.metadata, al.created_at
+         FROM audit_logs al
+         LEFT JOIN users actor ON actor.id = al.actor_user_id
+         LEFT JOIN users target ON target.id = al.target_user_id
+         ORDER BY al.created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ),
+      pool.query(`SELECT COUNT(*)::int AS total FROM audit_logs`),
+    ]);
+
+    const total = countResult.rows[0].total;
+
+    return response.status(200).json({
+      auditLogs: logsResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     });
   })
 );
